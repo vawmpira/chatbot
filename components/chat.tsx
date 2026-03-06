@@ -10,9 +10,7 @@ import { MultimodalInput } from "./multimodal-input";
 import type { VisibilityType } from "./visibility-selector";
 
 declare global {
-  interface Window {
-    puter: any;
-  }
+  interface Window { puter: any; }
 }
 
 export function Chat({
@@ -30,44 +28,76 @@ export function Chat({
   isReadonly: boolean;
   autoResume: boolean;
 }) {
-  const router = useRouter();
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState<string>("");
   const [status, setStatus] = useState<"ready" | "streaming" | "submitted">("ready");
   const [currentModelId, setCurrentModelId] = useState(initialChatModel);
   const puterReady = useRef(false);
   const abortRef = useRef(false);
+  const chatSaved = useRef(false);
 
   // Load puter.js once
   useEffect(() => {
     if (puterReady.current || typeof window === "undefined") return;
     const existing = document.querySelector('script[src="https://js.puter.com/v2/"]');
-    if (existing) {
-      puterReady.current = true;
-      return;
-    }
+    if (existing) { puterReady.current = true; return; }
     const script = document.createElement("script");
     script.src = "https://js.puter.com/v2/";
     script.async = true;
-    script.onload = () => {
-      puterReady.current = true;
-    };
+    script.onload = () => { puterReady.current = true; };
     document.head.appendChild(script);
   }, []);
 
-  // Strip the "provider/" prefix before sending to puter
-  // e.g. "anthropic/claude-opus-4-6" → "claude-opus-4-6"
-  //      "openai/gpt-5" → "gpt-5"
-  //      "deepseek/deepseek-r1-0528" → "deepseek/deepseek-r1-0528" (kept, puter needs it)
+  // Strip provider prefix for puter: "openai/gpt-5" → "gpt-5", keep "deepseek/..."
   function toPuterModelId(modelId: string): string {
-    const knownPrefixes = ["openai/", "anthropic/", "google/"];
-    for (const prefix of knownPrefixes) {
-      if (modelId.startsWith(prefix)) {
-        return modelId.slice(prefix.length);
-      }
+    const stripPrefixes = ["openai/", "anthropic/", "google/"];
+    for (const prefix of stripPrefixes) {
+      if (modelId.startsWith(prefix)) return modelId.slice(prefix.length);
     }
-    // deepseek/ and others stay as-is
     return modelId;
+  }
+
+  // Generate a title from the first user message
+  async function generateTitle(text: string): Promise<string> {
+    try {
+      const res = await fetch("/api/save-chat", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chatId: id,
+          title: text.slice(0, 60),
+        }),
+      });
+      return text.slice(0, 60);
+    } catch {
+      return "New chat";
+    }
+  }
+
+  async function saveToDb(allMessages: ChatMessage[], isFirstMessage: boolean) {
+    try {
+      const title = isFirstMessage
+        ? (allMessages.find(m => m.role === "user")?.parts as any)?.[0]?.text?.slice(0, 60) ?? "New chat"
+        : undefined;
+
+      await fetch("/api/save-chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id,
+          title,
+          visibility: initialVisibilityType,
+          messages: allMessages.map(m => ({
+            id: m.id,
+            role: m.role,
+            parts: m.parts,
+            createdAt: (m as any).createdAt ?? new Date(),
+          })),
+        }),
+      });
+    } catch (e) {
+      console.error("Failed to save chat:", e);
+    }
   }
 
   const sendMessage = async (message: {
@@ -76,6 +106,8 @@ export function Chat({
   }) => {
     const text = message.parts.find((p) => p.type === "text")?.text ?? "";
     if (!text.trim()) return;
+
+    const isFirstMessage = messages.length === 0 && !chatSaved.current;
 
     const userMsg: ChatMessage = {
       id: generateUUID(),
@@ -92,12 +124,12 @@ export function Chat({
       createdAt: new Date(),
     } as any;
 
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+    const updatedMessages = [...messages, userMsg, assistantMsg];
+    setMessages(updatedMessages);
     setStatus("streaming");
     abortRef.current = false;
 
     try {
-      // Build full conversation history for context
       const history = [...messages, userMsg].map((m) => ({
         role: m.role as "user" | "assistant",
         content: (m.parts as any[])
@@ -107,24 +139,16 @@ export function Chat({
       }));
 
       const puterModel = toPuterModelId(currentModelId);
-
       const response = await window.puter.ai.chat(history, {
         model: puterModel,
         stream: true,
       });
 
       let accumulated = "";
-
       for await (const chunk of response) {
         if (abortRef.current) break;
-
-        const delta =
-          chunk?.text ??
-          chunk?.choices?.[0]?.delta?.content ??
-          "";
-
+        const delta = chunk?.text ?? chunk?.choices?.[0]?.delta?.content ?? "";
         accumulated += delta;
-
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
@@ -133,19 +157,21 @@ export function Chat({
           )
         );
       }
+
+      // Save to DB after response is complete
+      const finalMessages = [...messages, userMsg, {
+        ...assistantMsg,
+        parts: [{ type: "text", text: accumulated }],
+      }];
+
+      await saveToDb(finalMessages, isFirstMessage);
+      chatSaved.current = true;
+
     } catch (err: any) {
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantId
-            ? {
-                ...m,
-                parts: [
-                  {
-                    type: "text",
-                    text: `⚠️ Error: ${err?.message ?? "Something went wrong. Please try again."}`,
-                  },
-                ],
-              }
+            ? { ...m, parts: [{ type: "text", text: `⚠️ Error: ${err?.message ?? "Something went wrong."}` }] }
             : m
         )
       );
@@ -164,20 +190,14 @@ export function Chat({
     const lastUserIndex = [...messages].reverse().findIndex((m) => m.role === "user");
     if (lastUserIndex === -1) return;
     const lastUser = [...messages].reverse()[lastUserIndex];
-    // Remove everything from the last user message onward
     const cutIndex = messages.length - 1 - lastUserIndex;
     setMessages((prev) => prev.slice(0, cutIndex));
-    await sendMessage({
-      role: "user",
-      parts: lastUser.parts as any,
-    });
+    await sendMessage({ role: "user", parts: lastUser.parts as any });
   };
 
-  // Handle ?query= param on first load
   const searchParams = useSearchParams();
   const query = searchParams.get("query");
   const [hasAppendedQuery, setHasAppendedQuery] = useState(false);
-
   useEffect(() => {
     if (query && !hasAppendedQuery) {
       sendMessage({ role: "user", parts: [{ type: "text", text: query }] });
