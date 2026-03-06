@@ -482,7 +482,7 @@ function PureModelSelectorCompact({
     openai: "OpenAI",
     google: "Google",
     xai: "xAI",
-    reasoning: "Reasoning",
+    deepseek: "DeepSeek",
   };
 
   return (
