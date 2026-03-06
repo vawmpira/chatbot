@@ -164,7 +164,7 @@ export function Chat({
         parts: [{ type: "text", text: accumulated }],
       }];
 
-      await saveToDb(finalMessages, isFirstMessage);
+      await saveToDb(finalMessages as ChatMessage[], isFirstMessage);
       chatSaved.current = true;
 
     } catch (err: any) {
