@@ -80,7 +80,7 @@ export function Chat({
       }));
 
       const response = await window.puter.ai.chat(history, {
-        model: currentModelId,
+        model: currentModelId.split("/").slice(1).join("/"), // strips "openai/" → "gpt-5"
         stream: true,
       });
 
