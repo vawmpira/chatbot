@@ -36,18 +36,44 @@ export function Chat({
   const [status, setStatus] = useState<"ready" | "streaming" | "submitted">("ready");
   const [currentModelId, setCurrentModelId] = useState(initialChatModel);
   const puterReady = useRef(false);
+  const abortRef = useRef(false);
 
   // Load puter.js once
   useEffect(() => {
     if (puterReady.current || typeof window === "undefined") return;
+    const existing = document.querySelector('script[src="https://js.puter.com/v2/"]');
+    if (existing) {
+      puterReady.current = true;
+      return;
+    }
     const script = document.createElement("script");
     script.src = "https://js.puter.com/v2/";
     script.async = true;
-    script.onload = () => { puterReady.current = true; };
+    script.onload = () => {
+      puterReady.current = true;
+    };
     document.head.appendChild(script);
   }, []);
 
-  const sendMessage = async (message: { role: "user"; parts: { type: string; text: string }[] }) => {
+  // Strip the "provider/" prefix before sending to puter
+  // e.g. "anthropic/claude-opus-4-6" → "claude-opus-4-6"
+  //      "openai/gpt-5" → "gpt-5"
+  //      "deepseek/deepseek-r1-0528" → "deepseek/deepseek-r1-0528" (kept, puter needs it)
+  function toPuterModelId(modelId: string): string {
+    const knownPrefixes = ["openai/", "anthropic/", "google/"];
+    for (const prefix of knownPrefixes) {
+      if (modelId.startsWith(prefix)) {
+        return modelId.slice(prefix.length);
+      }
+    }
+    // deepseek/ and others stay as-is
+    return modelId;
+  }
+
+  const sendMessage = async (message: {
+    role: "user";
+    parts: { type: string; text?: string }[];
+  }) => {
     const text = message.parts.find((p) => p.type === "text")?.text ?? "";
     if (!text.trim()) return;
 
@@ -68,9 +94,10 @@ export function Chat({
 
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
     setStatus("streaming");
+    abortRef.current = false;
 
     try {
-      // Build conversation history for context
+      // Build full conversation history for context
       const history = [...messages, userMsg].map((m) => ({
         role: m.role as "user" | "assistant",
         content: (m.parts as any[])
@@ -79,15 +106,25 @@ export function Chat({
           .join(""),
       }));
 
+      const puterModel = toPuterModelId(currentModelId);
+
       const response = await window.puter.ai.chat(history, {
-        model: currentModelId.split("/").slice(1).join("/"), // strips "openai/" → "gpt-5"
+        model: puterModel,
         stream: true,
       });
 
       let accumulated = "";
+
       for await (const chunk of response) {
-        const delta = chunk?.text ?? chunk?.choices?.[0]?.delta?.content ?? "";
+        if (abortRef.current) break;
+
+        const delta =
+          chunk?.text ??
+          chunk?.choices?.[0]?.delta?.content ??
+          "";
+
         accumulated += delta;
+
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
@@ -100,34 +137,54 @@ export function Chat({
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantId
-            ? { ...m, parts: [{ type: "text", text: `Error: ${err?.message ?? "Something went wrong"}` }] }
+            ? {
+                ...m,
+                parts: [
+                  {
+                    type: "text",
+                    text: `⚠️ Error: ${err?.message ?? "Something went wrong. Please try again."}`,
+                  },
+                ],
+              }
             : m
         )
       );
     } finally {
+      abortRef.current = false;
       setStatus("ready");
     }
   };
 
-  const stop = () => setStatus("ready");
-
-  const regenerate = async () => {
-    const lastUser = [...messages].reverse().find((m) => m.role === "user");
-    if (!lastUser) return;
-    setMessages((prev) => prev.filter((m) => m.role !== "assistant" || prev.indexOf(m) < prev.indexOf(lastUser)));
-    await sendMessage({ role: "user", parts: lastUser.parts as any });
+  const stop = () => {
+    abortRef.current = true;
+    setStatus("ready");
   };
 
-  // Handle ?query= param
+  const regenerate = async () => {
+    const lastUserIndex = [...messages].reverse().findIndex((m) => m.role === "user");
+    if (lastUserIndex === -1) return;
+    const lastUser = [...messages].reverse()[lastUserIndex];
+    // Remove everything from the last user message onward
+    const cutIndex = messages.length - 1 - lastUserIndex;
+    setMessages((prev) => prev.slice(0, cutIndex));
+    await sendMessage({
+      role: "user",
+      parts: lastUser.parts as any,
+    });
+  };
+
+  // Handle ?query= param on first load
   const searchParams = useSearchParams();
   const query = searchParams.get("query");
   const [hasAppendedQuery, setHasAppendedQuery] = useState(false);
+
   useEffect(() => {
     if (query && !hasAppendedQuery) {
       sendMessage({ role: "user", parts: [{ type: "text", text: query }] });
       setHasAppendedQuery(true);
       window.history.replaceState({}, "", `/chat/${id}`);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query, hasAppendedQuery]);
 
   return (
@@ -161,7 +218,7 @@ export function Chat({
             onModelChange={setCurrentModelId}
             selectedModelId={currentModelId}
             selectedVisibilityType={initialVisibilityType}
-            sendMessage={sendMessage}
+            sendMessage={sendMessage as any}
             setAttachments={() => {}}
             setInput={setInput}
             setMessages={setMessages as any}
